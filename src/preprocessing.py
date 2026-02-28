@@ -18,6 +18,28 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
+
+def _get_ffmpeg_exe() -> str:
+    """
+    Resolve the FFmpeg executable path.
+    Priority:
+      1. System PATH (ffmpeg / ffmpeg.exe)
+      2. imageio-ffmpeg bundled binary (installed with the project venv)
+    Raises RuntimeError if neither is found.
+    """
+    import shutil
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "FFmpeg not found. Install imageio-ffmpeg: pip install imageio-ffmpeg"
+    )
+
 # ImageNet-style normalisation constants (standard for pre-trained backbones)
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -43,8 +65,9 @@ def extract_frames_ffmpeg(
     os.makedirs(out_dir, exist_ok=True)
 
     pattern = os.path.join(out_dir, "frame_%06d.png")
+    ffmpeg_exe = _get_ffmpeg_exe()
     cmd = [
-        "ffmpeg", "-y",
+        ffmpeg_exe, "-y",
         "-i", video_path,
         "-vf", f"fps={fps}",
         "-q:v", "2",

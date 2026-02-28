@@ -6,6 +6,7 @@ torchvision
 # Video processing
 opencv-python
 ffmpeg-python
+imageio-ffmpeg   # bundled FFmpeg binary — no system install needed
 
 # Numerics & ML utilities
 numpy

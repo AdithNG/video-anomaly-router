@@ -155,7 +155,7 @@ def main():
                  "val_loss": best_val_loss, "args": vars(args)},
                 save_path,
             )
-            logger.info(f"  ✓ Saved best checkpoint → {save_path}")
+            logger.info(f"  [saved] Best checkpoint -> {save_path}")
 
     logger.info("Training complete.")
 
