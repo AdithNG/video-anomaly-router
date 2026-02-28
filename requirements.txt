@@ -1,0 +1,20 @@
+# Deep learning - install PyTorch with CUDA 12.4 support separately:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch
+torchvision
+
+# Video processing
+opencv-python
+ffmpeg-python
+
+# Numerics & ML utilities
+numpy
+scikit-learn
+scipy
+
+# Visualization & progress
+matplotlib
+tqdm
+
+# Config & logging
+pyyaml
