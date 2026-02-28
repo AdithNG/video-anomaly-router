@@ -51,6 +51,63 @@ The overall AUC is expected to improve significantly once the large model is tra
 
 ---
 
+## Initial Findings & Analysis
+
+### What the first evaluation actually tells us
+
+The headline number of **0.6399 AUC** is misleading. Looking at the per-scene breakdown reveals a much clearer picture:
+
+| Scene | AUC | Interpretation |
+|---|---|---|
+| Test002 | 1.0000 | Perfect -- anomalies are clearly distinguishable |
+| Test004 | 1.0000 | Perfect |
+| Test007 | 1.0000 | Perfect |
+| Test003 | 0.9247 | Very strong |
+| Test005 | 0.9184 | Very strong |
+| Test006 | 0.8320 | Good |
+| Test012 | 0.7460 | Reasonable |
+| **Test001** | **0.3400** | **Worse than random -- model is inverting scores** |
+| Test008-011 | N/A | No label variation in these scenes (AUC undefined) |
+
+**7 out of 8 evaluable scenes score 0.75 or above.** The small model works well for clear-cut anomalies. The 0.64 overall average is dragged down entirely by one scene: Test001.
+
+### Why is Test001 so bad?
+
+Test001 scores **0.34 AUC** -- worse than a random classifier (0.5). This means the model is actively assigning *lower* reconstruction error to anomalous frames than to normal ones. There are two likely causes:
+
+1. **Reconstruction quality inversion** -- the anomalies in Test001 (bikes/skaters moving through a pedestrian area) may involve motion patterns that the small model happens to reconstruct well, while some normal frames in that scene are harder to reconstruct (e.g. crowded backgrounds, lighting changes).
+
+2. **Limited model capacity** -- the small autoencoder (512-dim latent) may not have enough capacity to distinguish fine-grained motion patterns. It learns a rough reconstruction that generalises across both normal and anomalous clips in ambiguous scenes.
+
+This is exactly the failure mode the routing system is designed to address: clips where the small model is uncertain or unreliable should be escalated to the larger model.
+
+### Why is the escalation rate 0%?
+
+The router never escalated a single clip because the **threshold was never calibrated**. The default threshold value (0.02) was set before any training -- it has no relationship to the actual reconstruction errors produced by the trained model.
+
+In practice, reconstruction errors from the trained small AE are much larger than 0.02. Since all scores are above the threshold, the gray-zone signal (which fires when a score is *close* to the threshold) never triggers, and no other signal was strong enough to override.
+
+**Fix:** After training, score the normal training clips and set the threshold at the 95th percentile of those reconstruction errors. This calibrates the decision boundary to the model's actual output distribution.
+
+### What needs to happen next
+
+Three concrete steps to move from 0.64 AUC to a competitive result:
+
+**1. Calibrate the routing threshold**
+Score the training set with the trained small AE, collect all reconstruction errors, and call:
+```python
+router.calibrate_threshold(normal_scores, quantile=0.95)
+```
+This sets the threshold so that 95% of normal clips are classified as normal, and the top 5% (high-reconstruction-error normal clips) are treated as the decision boundary.
+
+**2. Train the large autoencoder and activate routing**
+With a calibrated threshold, ambiguous clips near the boundary (and OOD clips like those in Test001) will be escalated to the large ResNet3D + attention model, which has higher capacity to distinguish fine-grained motion differences.
+
+**3. Measure the cost-quality tradeoff**
+The key research question of this project: what fraction of clips actually need to be escalated to recover the lost AUC? If routing can bring Test001 from 0.34 to >0.7 while escalating only 10-20% of clips, the system demonstrates a meaningful efficiency gain over running the large model on everything.
+
+---
+
 ## Project Status
 
 | Component | Status |
