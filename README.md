@@ -26,28 +26,48 @@ Video Stream
 
 ## Current Results -- UCSD Ped2
 
-> Small autoencoder only (50 epochs, no routing yet). Large model + routing coming next.
+### Baseline: Small AE only (no routing)
 
 | Metric | Value |
 |---|---|
 | Frame-level AUC-ROC | **0.6399** |
 | Equal Error Rate | 0.4587 |
-| Escalation rate | 0% (large model not yet trained) |
+| Escalation rate | 0% |
 
-**Per-scene AUC-ROC:**
+### Routing Experiments
 
-| Scene | AUC |
-|---|---|
-| Test001 | 0.3400 |
-| Test002 | 1.0000 |
-| Test003 | 0.9247 |
-| Test004 | 1.0000 |
-| Test005 | 0.9184 |
-| Test006 | 0.8320 |
-| Test007 | 1.0000 |
-| Test012 | 0.7460 |
+All routing runs use a threshold calibrated at the 95th percentile of normal training scores (`q=0.95`, threshold=0.0889).
 
-The overall AUC is expected to improve significantly once the large model is trained and the router is activated -- the routing system is specifically designed to handle the hard scenes (like Test001) where the small model struggles.
+#### Gray-zone margin sweep -- original large model (kl-weight=1e-4, 30 epochs)
+
+| Margin | AUC | Escalation rate | Notes |
+|---|---|---|---|
+| 0.05 | 0.6370 | 26.9% | Targeted escalation |
+| 0.10 | 0.6339 | 39.7% | |
+| 0.15 | 0.6342 | 47.0% | |
+| 0.30 | 0.6330 | 80.7% | Effectively uses large model for everything |
+
+#### Score normalisation + high-KL large model (kl-weight=5e-3, 43 epochs)
+
+Retrained large model with 50x stronger KL regularisation to tighten the latent space. Added percentile-rank score normalisation so both models' scores are on the same [0,1] scale before routing decisions.
+
+| Config | AUC | Escalation rate |
+|---|---|---|
+| Normalised scores, margin=0.05 | 0.6150 | 29.9% |
+
+**Per-scene AUC-ROC (best routing config vs baseline):**
+
+| Scene | Small only | Routing v1 (margin=0.05) | Routing v2 (normalised) |
+|---|---|---|---|
+| Test001 | 0.3400 | 0.3900 | 0.4481 |
+| Test002 | 1.0000 | -- | 0.6768 |
+| Test003 | 0.9247 | -- | 0.8510 |
+| Test004 | 1.0000 | -- | 1.0000 |
+| Test005 | 0.9184 | -- | 0.9295 |
+| Test006 | 0.8320 | -- | 0.5750 |
+| Test007 | 1.0000 | -- | 1.0000 |
+| Test012 | 0.7460 | 0.4600 | 0.7049 |
+| **Overall** | **0.6399** | **0.6370** | **0.6150** |
 
 ---
 
@@ -89,22 +109,39 @@ In practice, reconstruction errors from the trained small AE are much larger tha
 
 **Fix:** After training, score the normal training clips and set the threshold at the 95th percentile of those reconstruction errors. This calibrates the decision boundary to the model's actual output distribution.
 
+### Routing pipeline diagnostic signals
+
+The per-scene routing diagnostics reveal that the router correctly identifies hard scenes:
+
+| Scene | gz_dist (mean) | Interpretation |
+|---|---|---|
+| Test001 | 0.036 | Clips sitting right at the decision boundary -- maximum routing pressure |
+| Test011 | 0.040 | Also near boundary |
+| Test012 | 0.068 | Moderately uncertain |
+| Test002-010 | 0.12–0.17 | Well-separated from threshold -- little routing needed |
+
+The gray-zone signal fires for Test001 clips because their reconstruction scores cluster near the threshold. This is the correct behaviour -- the router is identifying exactly the right clips for escalation. The limitation is that the large model doesn't resolve the score inversion in those clips.
+
+### Why routing hasn't improved AUC on Test001
+
+Test001 clips score **0.3400 AUC** (worse than random). Routing escalation brings it to 0.4481 with the normalised large model, but still below 0.5. The root cause:
+
+- In Test001, **anomalous clips (cyclists, skaters) have lower reconstruction error** than normal clips. This inverts the decision boundary -- no threshold or scaling can fix it.
+- Both the small and large autoencoders were trained only on normal clips. Both learn a reconstruction that generalises to certain anomaly patterns in Test001.
+- The issue is not model capacity -- it's the reconstruction objective itself. A model trained only on normals can't be guaranteed to assign higher error to every anomaly type.
+
 ### What needs to happen next
 
-Three concrete steps to move from 0.64 AUC to a competitive result:
+**1. Auxiliary discriminative signal**
+The reconstruction error alone is insufficient for Test001. Options:
+- Add a lightweight discriminator head trained with pseudo-anomaly augmentation (Random Erasing, time-shuffled clips)
+- Use a one-class SVM or isolation forest on the latent embeddings as a second signal alongside reconstruction error
 
-**1. Calibrate the routing threshold**
-Score the training set with the trained small AE, collect all reconstruction errors, and call:
-```python
-router.calibrate_threshold(normal_scores, quantile=0.95)
-```
-This sets the threshold so that 95% of normal clips are classified as normal, and the top 5% (high-reconstruction-error normal clips) are treated as the decision boundary.
+**2. Score ensemble**
+Average reconstruction score with an embedding-distance score (distance from the training centroid in latent space). The OOD signal already does this for routing decisions -- bringing it into the anomaly score directly may help Test001.
 
-**2. Train the large autoencoder and activate routing**
-With a calibrated threshold, ambiguous clips near the boundary (and OOD clips like those in Test001) will be escalated to the large ResNet3D + attention model, which has higher capacity to distinguish fine-grained motion differences.
-
-**3. Measure the cost-quality tradeoff**
-The key research question of this project: what fraction of clips actually need to be escalated to recover the lost AUC? If routing can bring Test001 from 0.34 to >0.7 while escalating only 10-20% of clips, the system demonstrates a meaningful efficiency gain over running the large model on everything.
+**3. Cost-quality tradeoff measurement**
+The key research question remains open: given a fixed escalation budget (e.g. 10%, 20%, 30%), what is the AUC-ROC at each budget level? The routing diagnostics are in place to measure this -- needs a sweep over `--gray-zone-margin` values with AUC recorded per budget point.
 
 ---
 
@@ -122,9 +159,12 @@ The key research question of this project: what fraction of clips actually need 
 | UCSD Ped2 dataset download + prep | Complete |
 | Small AE trained on UCSD Ped2 | Complete |
 | Evaluation script (AUC-ROC, EER) | Complete |
-| Large AE training | In progress |
-| Router threshold calibration | Pending |
-| Cost vs quality tradeoff analysis | Pending |
+| Large AE training (kl-weight=5e-3, 43 epochs) | Complete |
+| Router threshold calibration (q=0.95) | Complete |
+| Score normalisation (percentile rank) | Complete |
+| Routing v1 -- gray-zone margin sweep | Complete |
+| Routing v2 -- normalised scores + high-KL large model | Complete |
+| Cost vs quality tradeoff analysis (AUC vs budget curve) | In progress |
 | Avenue + ShanghaiTech benchmarks | Pending |
 
 ---
@@ -141,7 +181,8 @@ video-anomaly-router/
 |       |-- small_autoencoder.py   # Lightweight 3D-Conv VAE (512-dim latent)
 |       \-- large_autoencoder.py   # Deep ResNet3D + attention bottleneck (1024-dim)
 |-- scripts/
-|   \-- prepare_ucsd.py         # Download + organise UCSD Ped2 dataset
+|   |-- prepare_ucsd.py         # Download + organise UCSD Ped2 dataset
+|   \-- calibrate_router.py     # Score training clips, build percentile normalisers, save router state
 |-- tests/
 |   |-- test_device.py          # 13 tests for device management
 |   |-- test_preprocessing.py   # 18 tests for preprocessing pipeline
@@ -276,21 +317,28 @@ Checkpoints are saved to `checkpoints/` as `{model}_ae_best.pt`.
 ## Evaluation
 
 ```bash
-# Small model only
-python evaluate.py \
-    --small-ckpt checkpoints/small_ae_best.pt \
-    --test-data  data/ucsd_ped2/test \
-    --labels     data/ucsd_ped2/test_labels.csv
-
-# With large model + routing
-python evaluate.py \
+# 1. Calibrate router threshold + build score normalisers
+py scripts/calibrate_router.py \
     --small-ckpt checkpoints/small_ae_best.pt \
     --large-ckpt checkpoints/large_ae_best.pt \
-    --test-data  data/ucsd_ped2/test \
-    --labels     data/ucsd_ped2/test_labels.csv
+    --train-data data/ucsd_ped2/train \
+    --quantile   0.95 \
+    --out        checkpoints/router_state.pt
+
+# 2. Evaluate with routing (normalised scores, focused gray-zone margin)
+py evaluate.py \
+    --small-ckpt   checkpoints/small_ae_best.pt \
+    --large-ckpt   checkpoints/large_ae_best.pt \
+    --router-state checkpoints/router_state.pt \
+    --normalize-scores \
+    --gray-zone-margin 0.05 \
+    --out-dir logs/routing_v2
+
+# Small model only (no routing)
+py evaluate.py --small-ckpt checkpoints/small_ae_best.pt
 ```
 
-Outputs: AUC-ROC score, EER, per-scene breakdown, ROC curve PNG, and a frame scores CSV -- all saved to `logs/`.
+Outputs: AUC-ROC score, EER, per-scene breakdown with routing diagnostics (gray-zone distance, OOD score, temporal instability), ROC curve PNG, frame scores CSV, and `results_summary.json` -- all saved to `--out-dir`.
 
 ---
 
