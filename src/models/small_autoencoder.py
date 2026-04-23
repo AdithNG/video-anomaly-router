@@ -54,6 +54,11 @@ class SmallAutoencoder(nn.Module):
     Output: reconstruction   (B, C, T, H, W)
             latent           (B, latent_dim)
             log_var          (B, latent_dim)  — uncertainty proxy
+
+    When use_aux_head=True an auxiliary binary-classification head is attached
+    to the encoder bottleneck.  It is trained to distinguish normal clips from
+    pseudo-anomalous augmentations and its sigmoid output becomes an extra
+    anomaly signal at inference time.
     """
 
     def __init__(
@@ -63,6 +68,7 @@ class SmallAutoencoder(nn.Module):
         latent_dim: int = 512,
         clip_len: int = 16,
         frame_size: int = 64,
+        use_aux_head: bool = False,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -83,6 +89,14 @@ class SmallAutoencoder(nn.Module):
         self.fc_mu      = nn.Linear(flat, latent_dim)
         self.fc_log_var = nn.Linear(flat, latent_dim)   # for uncertainty estimation
         self.fc_decode  = nn.Linear(latent_dim, flat)
+
+        # ── Optional auxiliary head (normal vs. pseudo-anomaly classifier) ────
+        if use_aux_head:
+            self.aux_head = nn.Sequential(
+                nn.Linear(latent_dim, 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, 1),
+            )
 
         # ── Decoder ──────────────────────────────────────────────────────────
         self.dec4 = DeconvBlock3D(base_ch*8, base_ch*4, stride=(1,2,2))
@@ -145,16 +159,30 @@ def small_ae_loss(
     x: torch.Tensor,
     log_var: torch.Tensor,
     kl_weight: float = 1e-4,
+    aux_logit: torch.Tensor = None,
+    aux_labels: torch.Tensor = None,
+    aux_weight: float = 0.1,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Combined reconstruction + KL loss (VAE-style).
-    recon_loss: mean squared error per pixel/voxel.
-    kl_loss:    KL divergence regulariser on the latent.
+
+    Optional aux_logit / aux_labels add a BCE term from the pseudo-anomaly
+    auxiliary head.  Pass both or neither; aux_weight scales the term.
     """
     recon_loss = F.mse_loss(recon, x, reduction="mean")
-    kl_loss = -0.5 * torch.mean(1 + log_var - log_var.exp())
-    total = recon_loss + kl_weight * kl_loss
-    return total, {"recon": recon_loss.item(), "kl": kl_loss.item(), "total": total.item()}
+    kl_loss    = -0.5 * torch.mean(1 + log_var - log_var.exp())
+    total      = recon_loss + kl_weight * kl_loss
+    info       = {"recon": recon_loss.item(), "kl": kl_loss.item(), "total": total.item()}
+
+    if aux_logit is not None and aux_labels is not None:
+        aux_loss = F.binary_cross_entropy_with_logits(
+            aux_logit.squeeze(1), aux_labels.float()
+        )
+        total = total + aux_weight * aux_loss
+        info["aux"]   = aux_loss.item()
+        info["total"] = total.item()
+
+    return total, info
 
 
 # ---------------------------------------------------------------------------
@@ -166,23 +194,25 @@ def anomaly_score(
     model: SmallAutoencoder,
     clip: torch.Tensor,
     n_passes: int = 1,
-) -> Tuple[float, torch.Tensor, float]:
+    return_aux: bool = False,
+) -> Tuple:
     """
     Compute anomaly score for a single clip (C, T, H, W) or batch.
 
     Args:
-        model:   SmallAutoencoder in eval mode.
-        clip:    Tensor of shape (C, T, H, W) or (B, C, T, H, W).
-        n_passes: Number of stochastic forward passes for MC-dropout uncertainty.
-                  Set >1 only if dropout layers are present.
+        model:      SmallAutoencoder in eval mode.
+        clip:       Tensor of shape (C, T, H, W) or (B, C, T, H, W).
+        n_passes:   Stochastic forward passes (>1 only with dropout layers).
+        return_aux: If True and model has an aux_head, also return the aux score.
 
-    Returns:
-        score       – scalar reconstruction error (MSE)
-        embedding   – (latent_dim,) mean latent vector
-        uncertainty – scalar variance proxy (mean of exp(log_var))
+    Returns (return_aux=False):
+        score, embedding, uncertainty
+    Returns (return_aux=True):
+        score, embedding, uncertainty, aux_score
+        aux_score is 0.0 when the model has no aux_head.
     """
     if clip.dim() == 4:
-        clip = clip.unsqueeze(0)  # add batch dim
+        clip = clip.unsqueeze(0)
 
     scores, embeddings, variances = [], [], []
     for _ in range(n_passes):
@@ -192,7 +222,16 @@ def anomaly_score(
         embeddings.append(mu)
         variances.append(log_var.exp().mean().item())
 
-    score = float(sum(scores) / len(scores))
-    embedding = embeddings[0].squeeze(0)          # (latent_dim,)
+    score       = float(sum(scores) / len(scores))
+    embedding   = embeddings[0].squeeze(0)   # (latent_dim,)
     uncertainty = float(sum(variances) / len(variances))
+
+    if return_aux:
+        if hasattr(model, "aux_head"):
+            aux_logit = model.aux_head(embeddings[0])          # (1, 1)
+            aux_score = float(torch.sigmoid(aux_logit).mean())
+        else:
+            aux_score = 0.0
+        return score, embedding, uncertainty, aux_score
+
     return score, embedding, uncertainty

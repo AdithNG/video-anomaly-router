@@ -88,10 +88,22 @@ def parse_args():
                    help="Gray-zone half-width as fraction of threshold (default 0.3)")
     p.add_argument("--ood-threshold", type=float, default=0.4,
                    help="OOD cosine-distance cutoff (default 0.4)")
+    p.add_argument("--instability-threshold", type=float, default=0.005,
+                   help="Temporal variance cutoff for instability escalation (default 0.005)")
+    p.add_argument("--no-scene-cut", action="store_true",
+                   help="Disable scene-cut escalation signal")
     p.add_argument("--normalize-scores", action="store_true",
                    help="Map raw MSE to percentile rank within training distribution "
                         "(requires --router-state from calibrate_router.py with normalisers). "
                         "Makes small + large model scores comparable.")
+    p.add_argument("--aux-weight", type=float, default=0.0,
+                   help="Weight of auxiliary head score in final anomaly score "
+                        "(0 = disabled, 0.3 = 70%% recon + 30%% aux). "
+                        "Only active when small model was trained with --pseudo-anomaly.")
+    p.add_argument("--ood-ensemble-weight", type=float, default=0.0,
+                   help="Blend OOD cosine-distance into final anomaly score "
+                        "(0 = disabled, 0.2 = 80%% recon + 20%% OOD). "
+                        "Requires --router-state with a centroid.")
     p.add_argument("--out-dir",       default="logs",
                    help="Directory to save ROC curve plots and score CSVs")
     return p.parse_args()
@@ -103,13 +115,16 @@ def parse_args():
 
 def load_small(ckpt_path: str, clip_len: int, frame_size: int,
                device: torch.device) -> SmallAutoencoder:
-    model = SmallAutoencoder(clip_len=clip_len, frame_size=frame_size).to(device)
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt        = torch.load(ckpt_path, map_location=device, weights_only=False)
+    use_aux     = ckpt.get("args", {}).get("pseudo_anomaly", False)
+    model       = SmallAutoencoder(clip_len=clip_len, frame_size=frame_size,
+                                   use_aux_head=use_aux).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     epoch = ckpt.get("epoch", "?")
     val   = ckpt.get("val_loss", float("nan"))
-    logger.info(f"Loaded small AE  (epoch={epoch}, val_loss={val:.5f})")
+    aux_str = "  [aux head: ON]" if use_aux else ""
+    logger.info(f"Loaded small AE  (epoch={epoch}, val_loss={val:.5f}){aux_str}")
     return model
 
 
@@ -153,8 +168,10 @@ def score_scene(
     clip_len: int,
     frame_size: int,
     device: torch.device,
-    small_normaliser=None,   # callable(raw_score) -> percentile rank, or None
-    large_normaliser=None,   # callable(raw_score) -> percentile rank, or None
+    small_normaliser=None,      # callable(raw_score) -> percentile rank, or None
+    large_normaliser=None,      # callable(raw_score) -> percentile rank, or None
+    aux_weight: float = 0.0,    # blend auxiliary head score into anomaly score
+    ood_ensemble_weight: float = 0.0,  # blend OOD cosine-distance into score
 ) -> tuple:
     """
     Score all frames in a scene directory.
@@ -191,27 +208,43 @@ def score_scene(
     ood_scores   = []
     instabs      = []
 
+    has_aux = hasattr(small_model, "aux_head") and aux_weight > 0.0
+
     for i, (clip, cut) in enumerate(zip(clips, scene_cuts)):
         clip_gpu = safe_to_device(clip.unsqueeze(0), device)  # (1, C, T, H, W)
 
-        # Score with small model
-        raw_small, embedding, uncertainty = small_anomaly_score(small_model, clip_gpu)
-        # Apply normalisation if available (converts to percentile rank)
-        small_score = small_normaliser(raw_small) if small_normaliser else raw_small
+        # Score with small model (optionally get aux head output)
+        if has_aux:
+            raw_small, embedding, uncertainty, aux_score = small_anomaly_score(
+                small_model, clip_gpu, return_aux=True
+            )
+        else:
+            raw_small, embedding, uncertainty = small_anomaly_score(small_model, clip_gpu)
+            aux_score = 0.0
 
-        # Routing decision (always uses the raw or normalised small score consistently)
-        decision = router.route(small_score, embedding, uncertainty, scene_cut=cut)
+        # Normalised reconstruction score (percentile rank or raw)
+        recon_score = small_normaliser(raw_small) if small_normaliser else raw_small
 
-        small_scores_list.append(small_score)
+        # Routing decision always uses the reconstruction-based score
+        decision = router.route(recon_score, embedding, uncertainty, scene_cut=cut)
+
+        small_scores_list.append(recon_score)
         gz_dists.append(decision.gray_zone_dist)
         ood_scores.append(decision.ood_score)
         instabs.append(decision.temporal_instability)
+
+        # ── Build final small-model anomaly score (ensemble) ──────────────────
+        small_score = recon_score
+        if has_aux:
+            small_score = (1.0 - aux_weight) * small_score + aux_weight * aux_score
+        if ood_ensemble_weight > 0.0:
+            small_score = ((1.0 - ood_ensemble_weight) * small_score
+                           + ood_ensemble_weight * decision.ood_score)
 
         if decision.escalate:
             routing_decisions += 1
             if large_model is not None:
                 raw_large, _, _ = large_anomaly_score(large_model, clip_gpu)
-                # Apply large model normalisation if available
                 final_score = large_normaliser(raw_large) if large_normaliser else raw_large
                 actual_escalations += 1
             else:
@@ -323,6 +356,8 @@ def main():
         threshold=router_threshold,
         gray_zone_margin=args.gray_zone_margin,
         ood_threshold=args.ood_threshold,
+        instability_threshold=args.instability_threshold,
+        scene_cut_escalate=not args.no_scene_cut,
         budget_capacity=10_000,
         budget_refill=1.0,   # effectively unlimited for evaluation
     )
@@ -382,6 +417,8 @@ def main():
             args.clip_len, args.frame_size, device,
             small_normaliser=small_normaliser,
             large_normaliser=large_normaliser,
+            aux_weight=args.aux_weight,
+            ood_ensemble_weight=args.ood_ensemble_weight,
         )
         labels = np.array(gt_labels[scene_name])
 
@@ -432,6 +469,10 @@ def main():
           f"OOD threshold: {args.ood_threshold}")
     if large_model is None:
         print("  [No large model loaded — router decisions tracked but not acted on]")
+    if hasattr(small_model, "aux_head") and args.aux_weight > 0:
+        print(f"  Aux head score blend : {args.aux_weight:.2f}")
+    if args.ood_ensemble_weight > 0:
+        print(f"  OOD ensemble blend   : {args.ood_ensemble_weight:.2f}")
     print("-" * 65)
     print("  Per-scene AUC-ROC  +  routing signal diagnostics:")
     print(f"  {'Scene':12s}  {'AUC':>6}  {'score_mean':>10}  "
@@ -490,6 +531,8 @@ def main():
         "ood_threshold":       args.ood_threshold,
         "large_model_used":    large_model is not None,
         "score_normalised":    args.normalize_scores and small_normaliser is not None,
+        "aux_weight":          args.aux_weight,
+        "ood_ensemble_weight": args.ood_ensemble_weight,
         "per_scene_auc":       {
             k: (round(v, 4) if not np.isnan(v) else None)
             for k, v in sorted(scene_results.items())

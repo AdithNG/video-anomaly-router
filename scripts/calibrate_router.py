@@ -156,13 +156,16 @@ def main():
     device = get_device()
 
     # ── Load small model ──────────────────────────────────────────────────────
-    small_model = SmallAutoencoder(clip_len=args.clip_len, frame_size=args.frame_size).to(device)
-    ckpt = torch.load(args.small_ckpt, map_location=device)
+    ckpt      = torch.load(args.small_ckpt, map_location=device, weights_only=False)
+    use_aux   = ckpt.get("args", {}).get("pseudo_anomaly", False)
+    small_model = SmallAutoencoder(clip_len=args.clip_len, frame_size=args.frame_size,
+                                   use_aux_head=use_aux).to(device)
     small_model.load_state_dict(ckpt["model_state"])
     small_model.eval()
     epoch    = ckpt.get("epoch", "?")
     val_loss = ckpt.get("val_loss", float("nan"))
-    logger.info(f"Loaded small AE checkpoint (epoch={epoch}, val_loss={val_loss:.5f})")
+    aux_str  = "  [aux head: ON]" if use_aux else ""
+    logger.info(f"Loaded small AE checkpoint (epoch={epoch}, val_loss={val_loss:.5f}){aux_str}")
 
     # ── Optionally load large model ───────────────────────────────────────────
     large_model = None
