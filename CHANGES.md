@@ -88,8 +88,6 @@ and normalised-score AUC values not directly comparable.
 
 ---
 
----
-
 ## 3. Routing Ablation Study
 
 **Log dirs:** `logs/ablation/`
@@ -222,16 +220,8 @@ All figures are pre-generated and ready to embed. Paths are relative to project 
 | Ped1 recalibrated ROC | `logs/ped1_recalibrated/roc_curve.png` | UCSD Ped1 domain-recalibrated (AUC=0.45, shows failure to generalise). |
 | Ped1 zero-shot ROC | `logs/ped1_zeroshot/roc_curve.png` | UCSD Ped1 zero-shot with Ped2 calibration (AUC=0.50, 100% escalation). |
 
----
-
-## 6. Planned
-
-- CUHK Avenue evaluation (requires manual dataset download)
-- ShanghaiTech evaluation (requires manual dataset download)
-- Ablation table for the final report
-
-**Prep scripts ready** (dataset download/extraction + GT CSV generation):
-- `scripts/prepare_avenue.py`     — CUHK Avenue (16 train / 21 test scenes)
+Additional prep scripts (data not downloaded, scripts ready to run if needed):
+- `scripts/prepare_avenue.py` — CUHK Avenue (16 train / 21 test scenes)
 - `scripts/prepare_shanghaitech.py` — ShanghaiTech (330 train / 107 test clips)
 
 ---
@@ -243,4 +233,5 @@ All figures are pre-generated and ready to embed. Paths are relative to project 
 | 2026-04-22 | Pareto sweep script written and executed (50 margins, ~27 seconds) |
 | 2026-04-22 | Pareto curve confirmed: routing dominates both baselines at 4–40% escalation |
 | 2026-04-22 | UCSD Ped1 prep script + cross-dataset evaluation (zero-shot + domain-recalibrated) |
-| 2026-04-22 | CUHK Avenue + ShanghaiTech prep scripts written (awaiting data download) |
+| 2026-04-22 | Routing ablation study: gray-zone is sole contributor to AUC gain on Ped2 |
+| 2026-04-22 | CUHK Avenue + ShanghaiTech prep scripts written (data not downloaded) |
